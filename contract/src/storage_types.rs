@@ -5,6 +5,9 @@ use soroban_sdk::{contracttype, Address, String, Symbol, Vec};
 pub enum DataKey {
     /// Keyed by market_id. Represents a prediction market instance.
     Market(u64),
+    /// Keyed by market_id. Stores the ordered list of all predictor addresses for that market.
+    /// Updated whenever a new prediction is submitted so cancel_market can iterate all stakers.
+    PredictorList(u64),
     /// Keyed by (market_id, predictor). Represents a user's prediction in a given market.
     Prediction(u64, Address),
     /// Keyed by user address. Represents an individual user's profile or state.
@@ -92,6 +95,9 @@ pub struct Market {
     pub is_closed: bool,
     /// Indicates whether the market has been resolved and payouts processed. Defaults to false.
     pub is_resolved: bool,
+    /// Indicates whether the market has been administratively cancelled. When true, no further
+    /// predictions are accepted and all stakes are refunded. Defaults to false.
+    pub is_cancelled: bool,
     /// If true, the market is open to anyone. If false, it acts as a private competition.
     pub is_public: bool,
     /// The aggregate amount of native tokens (XLM in stroops) staked in the market. Defaults to 0.
@@ -137,6 +143,7 @@ impl Market {
             resolved_outcome: None,
             is_closed: false,
             is_resolved: false,
+            is_cancelled: false,
             is_public,
             total_pool: 0,
             creator_fee_bps,

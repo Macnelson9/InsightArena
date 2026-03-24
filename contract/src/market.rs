@@ -2,7 +2,8 @@ use soroban_sdk::{contracttype, symbol_short, Address, Env, String, Symbol, Vec}
 
 use crate::config::{self, PERSISTENT_BUMP, PERSISTENT_THRESHOLD};
 use crate::errors::InsightArenaError;
-use crate::storage_types::{DataKey, Market};
+use crate::escrow;
+use crate::storage_types::{DataKey, Market, Prediction};
 
 // ── Params struct ─────────────────────────────────────────────────────────────
 // Soroban limits contract functions to 10 parameters. Bundling the market
@@ -71,6 +72,13 @@ fn emit_market_created(env: &Env, market_id: u64, creator: &Address, end_time: u
 fn emit_market_closed(env: &Env, market_id: u64, caller: &Address) {
     env.events().publish(
         (symbol_short!("mkt"), symbol_short!("closed")),
+        (market_id, caller.clone()),
+    );
+}
+
+fn emit_market_cancelled(env: &Env, market_id: u64, caller: &Address) {
+    env.events().publish(
+        (symbol_short!("mkt"), symbol_short!("canceld")),
         (market_id, caller.clone()),
     );
 }
@@ -264,6 +272,70 @@ pub fn close_market(env: &Env, caller: Address, market_id: u64) -> Result<(), In
     Ok(())
 }
 
+/// Cancel a market that could not be resolved (oracle failure, creator error, etc.).
+///
+/// Upon cancellation every predictor's full stake is refunded via the escrow
+/// module. No payouts or fees are processed.
+///
+/// Validation order:
+/// 1. Market exists
+/// 2. Market has not already been resolved
+/// 3. Market has not already been cancelled
+/// 4. `caller` must be the platform admin
+///
+/// On success:
+/// - `market.is_cancelled` is set to `true` and persisted.
+/// - All entries in `PredictorList(market_id)` are iterated; for each, the
+///   corresponding `Prediction` record is loaded and `escrow::refund` is called.
+/// - A `MarketCancelled` event is emitted.
+pub fn cancel_market(env: &Env, caller: Address, market_id: u64) -> Result<(), InsightArenaError> {
+    // ── Guard 1: market must exist ────────────────────────────────────────────
+    let mut market = get_market(env, market_id)?;
+
+    // ── Guard 2: market must not already be resolved ──────────────────────────
+    if market.is_resolved {
+        return Err(InsightArenaError::MarketAlreadyResolved);
+    }
+
+    // ── Guard 3: market must not already be cancelled ─────────────────────────
+    if market.is_cancelled {
+        return Err(InsightArenaError::MarketAlreadyCancelled);
+    }
+
+    // ── Guard 4: only the platform admin may cancel ───────────────────────────
+    caller.require_auth();
+    let cfg = config::get_config(env)?;
+    if caller != cfg.admin {
+        return Err(InsightArenaError::Unauthorized);
+    }
+
+    // ── Mark market as cancelled and persist ──────────────────────────────────
+    market.is_cancelled = true;
+    env.storage()
+        .persistent()
+        .set(&DataKey::Market(market_id), &market);
+    bump_market(env, market_id);
+
+    // ── Iterate all predictors and issue refunds ──────────────────────────────
+    let predictors: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PredictorList(market_id))
+        .unwrap_or_else(|| Vec::new(env));
+
+    for predictor in predictors.iter() {
+        let key = DataKey::Prediction(market_id, predictor.clone());
+        if let Some(prediction) = env.storage().persistent().get::<DataKey, Prediction>(&key) {
+            escrow::refund(env, &predictor, prediction.stake_amount)?;
+        }
+    }
+
+    // ── Emit MarketCancelled event ────────────────────────────────────────────
+    emit_market_cancelled(env, market_id, &caller);
+
+    Ok(())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -275,13 +347,21 @@ mod market_tests {
 
     use super::CreateMarketParams;
 
+    /// Register a mock XLM token (Stellar Asset Contract) and return its address.
+    fn register_token(env: &Env) -> Address {
+        let token_admin = Address::generate(env);
+        env.register_stellar_asset_contract_v2(token_admin)
+            .address()
+    }
+
     fn deploy(env: &Env) -> InsightArenaContractClient<'_> {
         let id = env.register(InsightArenaContract, ());
         let client = InsightArenaContractClient::new(env, &id);
         let admin = Address::generate(env);
         let oracle = Address::generate(env);
+        let xlm_token = register_token(env);
         env.mock_all_auths();
-        client.initialize(&admin, &oracle, &200_u32);
+        client.initialize(&admin, &oracle, &200_u32, &xlm_token);
         client
     }
 
@@ -537,9 +617,22 @@ mod market_tests {
         let client = InsightArenaContractClient::new(env, &id);
         let admin = Address::generate(env);
         let oracle = Address::generate(env);
+        let xlm_token = register_token(env);
         env.mock_all_auths();
-        client.initialize(&admin, &oracle, &200_u32);
+        client.initialize(&admin, &oracle, &200_u32, &xlm_token);
         (client, admin, oracle)
+    }
+
+    /// Helper: deploy contract, return client + admin + oracle + token address.
+    fn deploy_with_token(env: &Env) -> (InsightArenaContractClient<'_>, Address, Address, Address) {
+        let id = env.register(InsightArenaContract, ());
+        let client = InsightArenaContractClient::new(env, &id);
+        let admin = Address::generate(env);
+        let oracle = Address::generate(env);
+        let xlm_token = register_token(env);
+        env.mock_all_auths();
+        client.initialize(&admin, &oracle, &200_u32, &xlm_token);
+        (client, admin, oracle, xlm_token)
     }
 
     // (a) close_market called before end_time → MarketStillOpen
@@ -648,5 +741,180 @@ mod market_tests {
             result,
             Err(Ok(InsightArenaError::MarketAlreadyResolved))
         ));
+    }
+
+    // ── cancel_market ─────────────────────────────────────────────────────────
+
+    // (a) Non-admin caller → Unauthorized
+    #[test]
+    fn cancel_market_fails_for_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _oracle, _token) = deploy_with_token(&env);
+        let creator = Address::generate(&env);
+        let random = Address::generate(&env);
+
+        let id = client.create_market(&creator, &default_params(&env));
+
+        let result = client.try_cancel_market(&random, &id);
+        assert!(matches!(result, Err(Ok(InsightArenaError::Unauthorized))));
+    }
+
+    // (b) Unknown market_id → MarketNotFound
+    #[test]
+    fn cancel_market_fails_market_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _oracle, _token) = deploy_with_token(&env);
+
+        let result = client.try_cancel_market(&admin, &99_u64);
+        assert!(matches!(result, Err(Ok(InsightArenaError::MarketNotFound))));
+    }
+
+    // (c) Already-resolved market → MarketAlreadyResolved
+    #[test]
+    fn cancel_market_fails_when_already_resolved() {
+        use crate::storage_types::{DataKey, Market};
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _oracle, _token) = deploy_with_token(&env);
+        let creator = Address::generate(&env);
+
+        let id = client.create_market(&creator, &default_params(&env));
+
+        // Simulate resolution via direct storage mutation.
+        let contract_id = client.address.clone();
+        let mut market: Market = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Market(id))
+                .unwrap()
+        });
+        market.is_resolved = true;
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Market(id), &market);
+        });
+
+        let result = client.try_cancel_market(&admin, &id);
+        assert!(matches!(
+            result,
+            Err(Ok(InsightArenaError::MarketAlreadyResolved))
+        ));
+    }
+
+    // (d) Double-cancel → MarketAlreadyCancelled
+    #[test]
+    fn cancel_market_fails_when_already_cancelled() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _oracle, _token) = deploy_with_token(&env);
+        let creator = Address::generate(&env);
+
+        let id = client.create_market(&creator, &default_params(&env));
+        client.cancel_market(&admin, &id); // first cancel succeeds
+
+        let result = client.try_cancel_market(&admin, &id);
+        assert!(matches!(
+            result,
+            Err(Ok(InsightArenaError::MarketAlreadyCancelled))
+        ));
+    }
+
+    // (e) Successful cancel with no predictors → market.is_cancelled == true,
+    //     MarketCancelled event emitted, no refund calls made.
+    #[test]
+    fn cancel_market_success_no_predictors() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _oracle, _token) = deploy_with_token(&env);
+        let creator = Address::generate(&env);
+
+        let id = client.create_market(&creator, &default_params(&env));
+        client.cancel_market(&admin, &id);
+
+        let market = client.get_market(&id);
+        assert!(market.is_cancelled);
+        assert!(!market.is_resolved);
+    }
+
+    // (f) Cancel with multiple predictors → all stakes refunded, balances restored.
+    //
+    // Because no `predict` function exists yet, predictions are seeded directly
+    // into persistent storage (same technique as the close_market resolved test).
+    // The contract escrow balance is pre-funded by minting tokens to the contract.
+    #[test]
+    fn cancel_market_refunds_all_predictors() {
+        use crate::storage_types::{DataKey, Prediction};
+        use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _oracle, xlm_token) = deploy_with_token(&env);
+        let creator = Address::generate(&env);
+
+        let id = client.create_market(&creator, &default_params(&env));
+
+        // Prepare two predictors with distinct stakes.
+        let predictor_a = Address::generate(&env);
+        let predictor_b = Address::generate(&env);
+        let stake_a: i128 = 20_000_000; // 2 XLM
+        let stake_b: i128 = 50_000_000; // 5 XLM
+
+        let contract_id = client.address.clone();
+
+        // Seed Prediction records and PredictorList directly into contract storage.
+        env.as_contract(&contract_id, || {
+            let pred_a = Prediction::new(
+                id,
+                predictor_a.clone(),
+                symbol_short!("yes"),
+                stake_a,
+                env.ledger().timestamp(),
+            );
+            let pred_b = Prediction::new(
+                id,
+                predictor_b.clone(),
+                symbol_short!("no"),
+                stake_b,
+                env.ledger().timestamp(),
+            );
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Prediction(id, predictor_a.clone()), &pred_a);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Prediction(id, predictor_b.clone()), &pred_b);
+
+            let mut predictors = soroban_sdk::Vec::new(&env);
+            predictors.push_back(predictor_a.clone());
+            predictors.push_back(predictor_b.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::PredictorList(id), &predictors);
+        });
+
+        // Fund the contract escrow with the total staked amount.
+        let total_staked = stake_a + stake_b;
+        StellarAssetClient::new(&env, &xlm_token).mint(&contract_id, &total_staked);
+
+        // Confirm predictors start with zero balance.
+        let token_client = TokenClient::new(&env, &xlm_token);
+        assert_eq!(token_client.balance(&predictor_a), 0);
+        assert_eq!(token_client.balance(&predictor_b), 0);
+
+        // Cancel the market.
+        client.cancel_market(&admin, &id);
+
+        // Every predictor must receive exactly their stake back.
+        assert_eq!(token_client.balance(&predictor_a), stake_a);
+        assert_eq!(token_client.balance(&predictor_b), stake_b);
+
+        // Market must be flagged as cancelled.
+        let market = client.get_market(&id);
+        assert!(market.is_cancelled);
     }
 }

@@ -25,6 +25,8 @@ pub struct Config {
     pub min_stake_xlm: i128,
     /// Trusted oracle contract address used for market resolution.
     pub oracle_address: Address,
+    /// Address of the XLM Stellar Asset Contract used for escrow transfers.
+    pub xlm_token: Address,
     /// When `true`, all non-admin entry points must revert with `Paused`.
     pub is_paused: bool,
 }
@@ -59,6 +61,7 @@ pub fn initialize(
     admin: Address,
     oracle: Address,
     fee_bps: u32,
+    xlm_token: Address,
 ) -> Result<(), InsightArenaError> {
     if env.storage().persistent().has(&DataKey::Config) {
         return Err(InsightArenaError::AlreadyInitialized);
@@ -70,6 +73,7 @@ pub fn initialize(
         max_creator_fee_bps: 500,  // 5 % absolute cap for market creators
         min_stake_xlm: 10_000_000, // 1 XLM expressed in stroops
         oracle_address: oracle,
+        xlm_token,
         is_paused: false,
     };
 

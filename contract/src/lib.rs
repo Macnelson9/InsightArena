@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod errors;
+pub mod escrow;
 pub mod market;
 pub mod storage_types;
 
@@ -26,8 +27,9 @@ impl InsightArenaContract {
         admin: Address,
         oracle: Address,
         fee_bps: u32,
+        xlm_token: Address,
     ) -> Result<(), InsightArenaError> {
-        config::initialize(&env, admin, oracle, fee_bps)
+        config::initialize(&env, admin, oracle, fee_bps, xlm_token)
     }
 
     // ── Config read ───────────────────────────────────────────────────────────
@@ -101,6 +103,19 @@ impl InsightArenaContract {
     ) -> Result<(), InsightArenaError> {
         market::close_market(&env, caller, market_id)
     }
+
+    /// Cancel a market and refund all stakers.
+    ///
+    /// Only callable by the platform admin. Iterates every `Prediction` record
+    /// stored under `PredictorList(market_id)` and returns each stake via the
+    /// escrow module. Emits a `MarketCancelled` event on success.
+    pub fn cancel_market(
+        env: Env,
+        caller: Address,
+        market_id: u64,
+    ) -> Result<(), InsightArenaError> {
+        market::cancel_market(&env, caller, market_id)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -123,6 +138,12 @@ mod config_tests {
         InsightArenaContractClient::new(env, &id)
     }
 
+    fn register_token(env: &Env) -> Address {
+        let token_admin = Address::generate(env);
+        env.register_stellar_asset_contract_v2(token_admin)
+            .address()
+    }
+
     // (a) Contract initialised and not paused → get_config (guarded) succeeds
     #[test]
     fn ensure_not_paused_ok_when_running() {
@@ -132,7 +153,7 @@ mod config_tests {
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
 
-        client.initialize(&admin, &oracle, &200_u32);
+        client.initialize(&admin, &oracle, &200_u32, &register_token(&env));
 
         // get_config is the first publicly guarded function; passing means Ok(())
         client.get_config();
@@ -147,7 +168,7 @@ mod config_tests {
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
 
-        client.initialize(&admin, &oracle, &200_u32);
+        client.initialize(&admin, &oracle, &200_u32, &register_token(&env));
         client.set_paused(&true);
 
         // try_* variant returns Err(Ok(ContractError)) instead of panicking
@@ -175,7 +196,7 @@ mod config_tests {
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
 
-        client.initialize(&admin, &oracle, &200_u32);
+        client.initialize(&admin, &oracle, &200_u32, &register_token(&env));
         client.set_paused(&true);
         client.set_paused(&false);
 

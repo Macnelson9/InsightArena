@@ -40,6 +40,10 @@ pub enum InsightArenaError {
     /// Raised when resolution is attempted while the market is still accepting
     /// predictions.
     MarketStillOpen = 15,
+    /// The market has already been cancelled by an admin.
+    /// Raised when cancel_market is called a second time or when any post-cancel
+    /// mutation (prediction, resolution) is attempted.
+    MarketAlreadyCancelled = 19,
     /// The predicted outcome symbol is not present in `outcome_options`.
     /// Raised when a user submits a prediction with an unrecognised outcome.
     InvalidOutcome = 16,
