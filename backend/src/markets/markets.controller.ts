@@ -31,11 +31,11 @@ export class MarketsController {
   @ApiOperation({ summary: 'Fetch market by ID' })
   @ApiResponse({
     status: 200,
-    description: 'Market retrieved successfully',
+    description: 'Market with nested creator profile',
     type: Market,
   })
   @ApiResponse({ status: 404, description: 'Market not found' })
-  async getMarketById(@Param('id') id: string): Promise<Market | null> {
-    return this.marketsService.findById(id);
+  async getMarketById(@Param('id') id: string): Promise<Market> {
+    return this.marketsService.findByIdOrOnChainId(id);
   }
 }
