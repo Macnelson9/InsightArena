@@ -253,6 +253,56 @@ pub fn transfer_fee(
     Ok(())
 }
 
+/// Withdraw accumulated treasury fees to the admin address.
+///
+/// Only the contract admin may call this. The amount must not exceed the
+/// tracked treasury balance.
+///
+/// # Errors
+/// - `InvalidInput` when `amount <= 0`.
+/// - `Unauthorized` when caller is not the admin.
+/// - `InsufficientFunds` when `amount` exceeds the tracked treasury balance.
+/// - `EscrowEmpty` if the contract token balance cannot cover the withdrawal.
+pub fn withdraw_treasury(env: Env, caller: Address, amount: i128) -> Result<(), InsightArenaError> {
+    if amount <= 0 {
+        return Err(InsightArenaError::InvalidInput);
+    }
+
+    caller.require_auth();
+
+    let cfg = config::get_config(&env)?;
+    if caller != cfg.admin {
+        return Err(InsightArenaError::Unauthorized);
+    }
+
+    let treasury_balance: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Treasury)
+        .unwrap_or(0);
+
+    if amount > treasury_balance {
+        return Err(InsightArenaError::InsufficientFunds);
+    }
+
+    let client = token::Client::new(&env, &cfg.xlm_token);
+    let contract = env.current_contract_address();
+
+    if client.balance(&contract) < amount {
+        return Err(InsightArenaError::EscrowEmpty);
+    }
+
+    client.transfer(&contract, &caller, &amount);
+
+    let new_balance = treasury_balance - amount;
+    env.storage()
+        .persistent()
+        .set(&DataKey::Treasury, &new_balance);
+    bump_treasury(&env);
+
+    Ok(())
+}
+
 pub fn get_treasury_balance(env: &Env) -> i128 {
     env.storage()
         .persistent()
@@ -271,7 +321,7 @@ mod escrow_tests {
 
     use super::{
         assert_escrow_solvent, get_contract_balance, get_treasury_balance, lock_stake, refund,
-        release_payout,
+        release_payout, withdraw_treasury,
     };
 
     fn register_token(env: &Env) -> Address {
@@ -477,6 +527,94 @@ mod escrow_tests {
 
         let result = env.as_contract(&client.address, || refund(&env, &recipient, 0));
         assert_eq!(result, Err(InsightArenaError::InvalidInput));
+    }
+
+    #[test]
+    fn test_withdraw_treasury_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let xlm_token = register_token(&env);
+        let client = deploy(&env, &xlm_token);
+
+        // Get admin from config
+        let cfg = env.as_contract(&client.address, || crate::config::get_config(&env).unwrap());
+        let admin = cfg.admin.clone();
+        let fee_amount = 3_000_000_i128;
+
+        // Seed the contract with tokens and set the treasury tracker
+        fund(&env, &xlm_token, &client.address, fee_amount);
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Treasury, &fee_amount);
+        });
+
+        let token = TokenClient::new(&env, &xlm_token);
+        assert_eq!(token.balance(&client.address), fee_amount);
+
+        let result = env.as_contract(&client.address, || {
+            withdraw_treasury(env.clone(), admin.clone(), fee_amount)
+        });
+        assert_eq!(result, Ok(()));
+
+        // Token balance moved to admin
+        assert_eq!(token.balance(&admin), fee_amount);
+        assert_eq!(token.balance(&client.address), 0);
+
+        // Internal tracker decremented
+        let remaining = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::Treasury)
+                .unwrap_or(0)
+        });
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn test_withdraw_treasury_overdraft() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let xlm_token = register_token(&env);
+        let client = deploy(&env, &xlm_token);
+
+        let cfg = env.as_contract(&client.address, || crate::config::get_config(&env).unwrap());
+        let admin = cfg.admin.clone();
+
+        // Set treasury to small value but try to withdraw more
+        let treasury_bal = 1_000_000_i128;
+        fund(&env, &xlm_token, &client.address, 10_000_000);
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Treasury, &treasury_bal);
+        });
+
+        let result = env.as_contract(&client.address, || {
+            withdraw_treasury(env.clone(), admin.clone(), 5_000_000)
+        });
+        assert_eq!(result, Err(InsightArenaError::InsufficientFunds));
+    }
+
+    #[test]
+    fn test_withdraw_treasury_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let xlm_token = register_token(&env);
+        let client = deploy(&env, &xlm_token);
+
+        let random_user = Address::generate(&env);
+        let amount = 1_000_000_i128;
+
+        env.as_contract(&client.address, || {
+            env.storage().persistent().set(&DataKey::Treasury, &amount);
+        });
+        fund(&env, &xlm_token, &client.address, amount);
+
+        let result = env.as_contract(&client.address, || {
+            withdraw_treasury(env.clone(), random_user.clone(), amount)
+        });
+        assert_eq!(result, Err(InsightArenaError::Unauthorized));
     }
 
     #[test]
