@@ -10,6 +10,7 @@ import {
   HttpStatus,
   UseGuards,
 } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { BanGuard } from '../common/guards/ban.guard';
 import { PredictionStatsDto } from './dto/prediction-stats.dto';
 import {
@@ -23,6 +24,7 @@ import { Market } from './entities/market.entity';
 import { Comment } from './entities/comment.entity';
 import { MarketTemplate } from './entities/market-template.entity';
 import { CreateMarketDto } from './dto/create-market.dto';
+import { BulkCreateMarketsDto } from './dto/bulk-create-markets.dto';
 import { CreateCommentDto } from './dto/create-comment.dto';
 import {
   ListMarketsDto,
@@ -37,7 +39,7 @@ import { User } from '../users/entities/user.entity';
 @ApiTags('Markets')
 @Controller('markets')
 export class MarketsController {
-  constructor(private readonly marketsService: MarketsService) {}
+  constructor(private readonly marketsService: MarketsService) { }
 
   @Get('templates')
   @Public()
@@ -79,6 +81,26 @@ export class MarketsController {
     @CurrentUser() user: User,
   ): Promise<Market> {
     return this.marketsService.create(dto, user);
+  }
+
+  @Post('bulk')
+  @UseGuards(BanGuard)
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @HttpCode(HttpStatus.CREATED)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Bulk create prediction markets (max 10 per request)' })
+  @ApiResponse({
+    status: 201,
+    description: 'Markets created',
+    type: [Market],
+  })
+  @ApiResponse({ status: 400, description: 'Validation error or exceeds limit' })
+  @ApiResponse({ status: 502, description: 'Soroban contract call failed' })
+  async bulkCreateMarkets(
+    @Body() dto: BulkCreateMarketsDto,
+    @CurrentUser() user: User,
+  ): Promise<Market[]> {
+    return this.marketsService.createBulk(dto.markets, user);
   }
 
   @Get()
@@ -148,5 +170,17 @@ export class MarketsController {
   @ApiResponse({ status: 404, description: 'Market not found' })
   async getComments(@Param('id') id: string): Promise<Comment[]> {
     return this.marketsService.getComments(id);
+  }
+
+  @Get(':id/report')
+  @Public()
+  @ApiOperation({ summary: 'Generate detailed market report with anonymized predictions' })
+  @ApiResponse({
+    status: 200,
+    description: 'Market report with outcome distribution and timeline',
+  })
+  @ApiResponse({ status: 404, description: 'Market not found' })
+  async getMarketReport(@Param('id') id: string): Promise<any> {
+    return this.marketsService.generateMarketReport(id);
   }
 }

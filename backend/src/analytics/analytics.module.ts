@@ -7,6 +7,7 @@ import { User } from '../users/entities/user.entity';
 import { AnalyticsController } from './analytics.controller';
 import { AnalyticsService } from './analytics.service';
 import { ActivityLog } from './entities/activity-log.entity';
+import { MarketHistory } from './entities/market-history.entity';
 
 @Module({
   imports: [
@@ -16,10 +17,11 @@ import { ActivityLog } from './entities/activity-log.entity';
       LeaderboardEntry,
       Market,
       ActivityLog,
+      MarketHistory,
     ]),
   ],
   controllers: [AnalyticsController],
   providers: [AnalyticsService],
   exports: [AnalyticsService],
 })
-export class AnalyticsModule {}
+export class AnalyticsModule { }
