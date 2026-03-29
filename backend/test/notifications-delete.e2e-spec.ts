@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { INestApplication, HttpStatus } from '@nestjs/common';
+import { INestApplication, HttpStatus, ExecutionContext } from '@nestjs/common';
 import request from 'supertest';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { NotificationsController } from '../src/notifications/notifications.controller';
@@ -46,8 +46,8 @@ describe('DELETE /notifications/:id (E2E)', () => {
     })
       .overrideGuard(JwtAuthGuard)
       .useValue({
-        canActivate: (context) => {
-          const req = context.switchToHttp().getRequest();
+        canActivate: (context: ExecutionContext) => {
+          const req = context.switchToHttp().getRequest<{ user: Partial<User> }>();
           req.user = mockUser;
           return true;
         },
@@ -92,6 +92,7 @@ describe('DELETE /notifications/:id (E2E)', () => {
       .delete('/notifications/invalid-id')
       .expect(HttpStatus.NOT_FOUND);
 
-    expect(res.body.error.message).toBe(errorMsg);
+    const body = res.body as { error: { message: string } };
+    expect(body.error.message).toBe(errorMsg);
   });
 });
