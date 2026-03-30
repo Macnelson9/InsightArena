@@ -27,6 +27,7 @@ import {
   ListParticipantsQueryDto,
   PaginatedParticipantsResponse,
 } from './dto/list-participants.dto';
+import { UserRankResponseDto } from './dto/user-rank-response.dto';
 import { Competition } from './entities/competition.entity';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Public } from '../common/decorators/public.decorator';
@@ -35,7 +36,7 @@ import { User } from '../users/entities/user.entity';
 @ApiTags('Competitions')
 @Controller('competitions')
 export class CompetitionsController {
-  constructor(private readonly competitionsService: CompetitionsService) {}
+  constructor(private readonly competitionsService: CompetitionsService) { }
 
   @Post()
   @UseGuards(BanGuard)
@@ -94,5 +95,21 @@ export class CompetitionsController {
     @Query() query: ListParticipantsQueryDto,
   ): Promise<PaginatedParticipantsResponse> {
     return this.competitionsService.getParticipants(id, query);
+  }
+
+  @Get(':id/my-rank')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Get current user rank in a competition' })
+  @ApiResponse({
+    status: 200,
+    description: 'User rank, score, and percentile',
+    type: UserRankResponseDto,
+  })
+  @ApiResponse({ status: 404, description: 'Competition or participant not found' })
+  async getMyRank(
+    @Param('id') id: string,
+    @CurrentUser() user: User,
+  ): Promise<UserRankResponseDto> {
+    return this.competitionsService.getMyRank(id, user.id);
   }
 }

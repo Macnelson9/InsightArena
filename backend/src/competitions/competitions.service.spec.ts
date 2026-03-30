@@ -41,6 +41,8 @@ describe('CompetitionsService', () => {
 
   const mockParticipantsRepository = {
     createQueryBuilder: jest.fn(),
+    findOne: jest.fn(),
+    count: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -225,6 +227,77 @@ describe('CompetitionsService', () => {
       await expect(
         service.getParticipants('non-existent', { page: 1, limit: 20 }),
       ).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('getMyRank', () => {
+    it('should return user rank and percentile', async () => {
+      mockRepository.findOne.mockResolvedValue(mockCompetition);
+      mockParticipantsRepository.findOne.mockResolvedValue({
+        id: 'part-1',
+        user_id: 'user-uuid-1',
+        score: 100,
+        joined_at: new Date('2024-01-01'),
+      });
+
+      const qbMock = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getCount: jest.fn().mockResolvedValue(4), // 4 people ahead
+      };
+      mockParticipantsRepository.createQueryBuilder.mockReturnValue(qbMock);
+      mockParticipantsRepository.count.mockResolvedValue(10); // 10 total
+
+      const result = await service.getMyRank('comp-uuid-1', 'user-uuid-1');
+
+      expect(result).toEqual({
+        rank: 5,
+        score: 100,
+        total_participants: 10,
+        percentile: 60, // (1 - (5-1)/10) * 100 = 60
+      });
+    });
+
+    it('should throw NotFoundException if user is not a participant', async () => {
+      mockRepository.findOne.mockResolvedValue(mockCompetition);
+      mockParticipantsRepository.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.getMyRank('comp-uuid-1', 'user-uuid-1'),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('should throw NotFoundException if competition does not exist', async () => {
+      mockRepository.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.getMyRank('non-existent', 'user-uuid-1'),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('should use cache on subsequent calls', async () => {
+      mockRepository.findOne.mockResolvedValue(mockCompetition);
+      mockParticipantsRepository.findOne.mockResolvedValue({
+        id: 'part-1',
+        user_id: 'user-uuid-1',
+        score: 100,
+        joined_at: new Date('2024-01-01'),
+      });
+
+      const qbMock = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getCount: jest.fn().mockResolvedValue(0),
+      };
+      mockParticipantsRepository.createQueryBuilder.mockReturnValue(qbMock);
+      mockParticipantsRepository.count.mockResolvedValue(1);
+
+      // First call
+      await service.getMyRank('comp-uuid-1', 'user-uuid-1');
+      // Second call should hit cache
+      await service.getMyRank('comp-uuid-1', 'user-uuid-1');
+
+      expect(mockParticipantsRepository.createQueryBuilder).toHaveBeenCalledTimes(1);
     });
   });
 });

@@ -18,15 +18,22 @@ import {
   PaginatedParticipantsResponse,
 } from './dto/list-participants.dto';
 import { User } from '../users/entities/user.entity';
+import { UserRankResponseDto } from './dto/user-rank-response.dto';
 
 @Injectable()
 export class CompetitionsService {
+  private rankCache = new Map<
+    string,
+    { data: UserRankResponseDto; timestamp: number }
+  >();
+  private readonly RANK_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
   constructor(
     @InjectRepository(Competition)
     private readonly competitionsRepository: Repository<Competition>,
     @InjectRepository(CompetitionParticipant)
     private readonly participantsRepository: Repository<CompetitionParticipant>,
-  ) {}
+  ) { }
 
   async create(dto: CreateCompetitionDto, user: User): Promise<Competition> {
     const inviteCode =
@@ -193,5 +200,70 @@ export class CompetitionsService {
       where: { id },
       relations: ['creator'],
     });
+  }
+
+  async getMyRank(
+    competitionId: string,
+    userId: string,
+  ): Promise<UserRankResponseDto> {
+    const cacheKey = `${competitionId}:${userId}`;
+    const cached = this.rankCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < this.RANK_CACHE_TTL_MS) {
+      return cached.data;
+    }
+
+    const competition = await this.competitionsRepository.findOne({
+      where: { id: competitionId },
+    });
+
+    if (!competition) {
+      throw new NotFoundException(
+        `Competition with ID "${competitionId}" not found`,
+      );
+    }
+
+    const participant = await this.participantsRepository.findOne({
+      where: { competition_id: competitionId, user_id: userId },
+    });
+
+    if (!participant) {
+      throw new NotFoundException(
+        `User is not a participant in competition "${competitionId}"`,
+      );
+    }
+
+    // Calculate rank: count participants with higher score,
+    // or same score but joined earlier.
+    const rank =
+      (await this.participantsRepository
+        .createQueryBuilder('p')
+        .where('p.competition_id = :competitionId', { competitionId })
+        .andWhere(
+          '(p.score > :score OR (p.score = :score AND p.joined_at < :joinedAt))',
+          {
+            score: participant.score,
+            joinedAt: participant.joined_at,
+          },
+        )
+        .getCount()) + 1;
+
+    const total_participants = await this.participantsRepository.count({
+      where: { competition_id: competitionId },
+    });
+
+    const percentile =
+      total_participants > 0
+        ? Math.round((1 - (rank - 1) / total_participants) * 10000) / 100
+        : 100;
+
+    const result: UserRankResponseDto = {
+      rank,
+      score: participant.score,
+      total_participants,
+      percentile,
+    };
+
+    this.rankCache.set(cacheKey, { data: result, timestamp: Date.now() });
+    return result;
   }
 }
