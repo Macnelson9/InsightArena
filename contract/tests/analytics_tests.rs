@@ -1,5 +1,6 @@
 use insightarena_contract::*;
 use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::Ledger as _;
 use soroban_sdk::token::StellarAssetClient;
 use soroban_sdk::{symbol_short, vec, Address, Env, String, Symbol};
 
@@ -18,6 +19,17 @@ fn deploy(env: &Env) -> (InsightArenaContractClient<'_>, Address) {
     env.mock_all_auths();
     client.initialize(&admin, &oracle, &200_u32, &xlm_token);
     (client, xlm_token)
+}
+
+fn deploy_with_oracle(env: &Env) -> (InsightArenaContractClient<'_>, Address, Address) {
+    let id = env.register(InsightArenaContract, ());
+    let client = InsightArenaContractClient::new(env, &id);
+    let admin = Address::generate(env);
+    let oracle = Address::generate(env);
+    let xlm_token = register_token(env);
+    env.mock_all_auths();
+    client.initialize(&admin, &oracle, &200_u32, &xlm_token);
+    (client, xlm_token, oracle)
 }
 
 fn default_params(env: &Env) -> CreateMarketParams {
@@ -291,4 +303,93 @@ fn test_analytics_aggregation() {
     let u2_stats = client.get_user_stats(&u2);
     assert_eq!(u2_stats.total_predictions, 2);
     assert_eq!(u2_stats.total_staked, 70_000_000);
+}
+
+#[test]
+fn test_get_market_stats_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, xlm) = deploy(&env);
+    let creator = Address::generate(&env);
+    let market_id = client.create_market(&creator, &default_params(&env));
+
+    let u1 = Address::generate(&env);
+    let u2 = Address::generate(&env);
+    fund(&env, &xlm, &u1, 40_000_000);
+    fund(&env, &xlm, &u2, 60_000_000);
+
+    client.submit_prediction(&u1, &market_id, &symbol_short!("yes"), &40_000_000);
+    client.submit_prediction(&u2, &market_id, &symbol_short!("no"), &60_000_000);
+
+    let stats = client.get_market_stats(&market_id);
+    assert_eq!(stats.total_pool, 100_000_000);
+    assert_eq!(stats.participant_count, 2);
+    assert_eq!(stats.leading_outcome, symbol_short!("no"));
+    assert_eq!(stats.leading_outcome_pool, 60_000_000);
+}
+
+#[test]
+fn test_track_multiple_markets_analytics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, xlm) = deploy(&env);
+    let creator = Address::generate(&env);
+
+    let market_a = client.create_market(&creator, &default_params(&env));
+    let market_b = client.create_market(&creator, &default_params(&env));
+
+    let u1 = Address::generate(&env);
+    let u2 = Address::generate(&env);
+    let u3 = Address::generate(&env);
+    fund(&env, &xlm, &u1, 50_000_000);
+    fund(&env, &xlm, &u2, 70_000_000);
+    fund(&env, &xlm, &u3, 30_000_000);
+
+    client.submit_prediction(&u1, &market_a, &symbol_short!("yes"), &50_000_000);
+    client.submit_prediction(&u2, &market_a, &symbol_short!("yes"), &20_000_000);
+    client.submit_prediction(&u3, &market_b, &symbol_short!("no"), &30_000_000);
+
+    let stats_a = client.get_market_stats(&market_a);
+    assert_eq!(stats_a.total_pool, 70_000_000);
+    assert_eq!(stats_a.participant_count, 2);
+    assert_eq!(stats_a.leading_outcome, symbol_short!("yes"));
+    assert_eq!(stats_a.leading_outcome_pool, 70_000_000);
+
+    let stats_b = client.get_market_stats(&market_b);
+    assert_eq!(stats_b.total_pool, 30_000_000);
+    assert_eq!(stats_b.participant_count, 1);
+    assert_eq!(stats_b.leading_outcome, symbol_short!("no"));
+    assert_eq!(stats_b.leading_outcome_pool, 30_000_000);
+}
+
+#[test]
+fn test_analytics_after_market_resolution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, xlm, oracle) = deploy_with_oracle(&env);
+    let creator = Address::generate(&env);
+    let params = default_params(&env);
+    let market_id = client.create_market(&creator, &params);
+
+    let u1 = Address::generate(&env);
+    let u2 = Address::generate(&env);
+    fund(&env, &xlm, &u1, 60_000_000);
+    fund(&env, &xlm, &u2, 40_000_000);
+
+    client.submit_prediction(&u1, &market_id, &symbol_short!("yes"), &60_000_000);
+    client.submit_prediction(&u2, &market_id, &symbol_short!("no"), &40_000_000);
+
+    env.ledger()
+        .with_mut(|li| li.timestamp = params.resolution_time + 1);
+    client.resolve_market(&oracle, &market_id, &symbol_short!("yes"));
+
+    let market = client.get_market(&market_id);
+    assert!(market.is_resolved);
+    assert_eq!(market.resolved_outcome.unwrap(), symbol_short!("yes"));
+
+    let stats = client.get_market_stats(&market_id);
+    assert_eq!(stats.total_pool, 100_000_000);
+    assert_eq!(stats.participant_count, 2);
+    assert_eq!(stats.leading_outcome, symbol_short!("yes"));
+    assert_eq!(stats.leading_outcome_pool, 60_000_000);
 }
